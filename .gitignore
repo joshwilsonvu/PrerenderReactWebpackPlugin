@@ -1,0 +1,7 @@
+node_modules/
+.idea
+public/js/main.*
+public/js/vendor.*
+*.swo
+*.swp
+.DS_Store
