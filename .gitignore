@@ -2,6 +2,7 @@ node_modules/
 .idea
 public/js/main.*
 public/js/vendor.*
+dist/
 *.swo
 *.swp
 .DS_Store
