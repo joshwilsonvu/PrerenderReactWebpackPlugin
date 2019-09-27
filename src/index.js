@@ -1,18 +1,18 @@
-const tapable = require("tapable");
-const webpack = require("webpack");
-const { RawSource } = require("webpack-sources");
-const nodeExternals = require("webpack-node-externals");
+const tapable = require('tapable');
+const webpack = require('webpack');
+const {RawSource} = require('webpack-sources');
+const nodeExternals = require('webpack-node-externals');
 //const HtmlWebpackPlugin = require("html-webpack-plugin"); // peer dependency
-const os = require("os");
-const path = require("path");
-const requireFromString = require("require-from-string");
-const NodeTemplatePlugin = require("webpack/lib/node/NodeTemplatePlugin");
-const NodeTargetPlugin = require("webpack/lib/node/NodeTargetPlugin");
-const LibraryTemplatePlugin = require("webpack/lib/LibraryTemplatePlugin");
-const SingleEntryPlugin = require("webpack/lib/SingleEntryPlugin");
-const MultiEntryPlugin = require("webpack/lib/MultiEntryPlugin");
+const os = require('os');
+const path = require('path');
+const requireFromString = require('require-from-string');
+const NodeTemplatePlugin = require('webpack/lib/node/NodeTemplatePlugin');
+const NodeTargetPlugin = require('webpack/lib/node/NodeTargetPlugin');
+const LibraryTemplatePlugin = require('webpack/lib/LibraryTemplatePlugin');
+const SingleEntryPlugin = require('webpack/lib/SingleEntryPlugin');
+const MultiEntryPlugin = require('webpack/lib/MultiEntryPlugin');
 
-const name = "PrerenderReactWebpackPlugin";
+const name = 'PrerenderReactWebpackPlugin';
 
 class PrerenderReactWebpackPlugin {
   constructor(options = {}) {
@@ -25,8 +25,8 @@ class PrerenderReactWebpackPlugin {
       parentCompiler.hooks.make.tapAsync(name, this.makeHook.bind(this));
       parentCompiler.hooks.emit.tap(name, this.emitHook.bind(this));
     } else {
-      parentCompiler.plugin("make", this.makeHook.bind(this));
-      parentCompiler.plugin("emit", this.emitHook.bind(this));
+      parentCompiler.plugin('make', this.makeHook.bind(this));
+      parentCompiler.plugin('emit', this.emitHook.bind(this));
     }
   }
 
@@ -35,27 +35,22 @@ class PrerenderReactWebpackPlugin {
     const parentOptions = parentCompiler.options;
 
     // compilation-specific configuration
-    this.chunks = getChunks(this.chunks, parentOptions);
-    this.assets = this.chunks.map(a => `${a}.prerender.js`); // match outputOptions.filename
-    // TODO: combine chunks and assets into a simple Array<{
-    //   chunk: string = chunk name, ex. main, etc.
-    //   asset: string = output filename, ex. chunk.prerender.js
-    //   entry: string | Array<string> = entry point or points, ex. index.js
-    // }>
+    this.prepareData(parentOptions.entry);
+
     const outputOptions = {
-      filename: "[name].prerender.js", // file format mapping chunks to assets
+      filename: '[name].prerender.js', // file format mapping chunks to assets
       futureEmitAssets: true
     };
 
-    // Only copy over allowed plugins, taken from prerender-loader
+    // Only copy over allowed plugins (from prerender-loader)
     const plugins = (parentOptions.plugins || []).filter(c => /(MiniCssExtractPlugin|ExtractTextPlugin)/i.test(c.constructor.name));
 
     // Create child compiler to compile a Node version of the app
-    let childCompiler = compilation.createChildCompiler("PrerenderReactChildCompiler", outputOptions, plugins);
+    let childCompiler = compilation.createChildCompiler('PrerenderReactChildCompiler', outputOptions, plugins);
     childCompiler.outputFileSystem = parentCompiler.outputFileSystem;
     childCompiler.context = parentCompiler.context;
-    childCompiler.options.externals = (childCompiler.options.externals || []).concat(nodeExternals()); // don't bundle node_modules
-
+    // don't bundle node_modules
+    childCompiler.options.externals = (childCompiler.options.externals || []).concat(nodeExternals());
 
     // Compile to CommonJS to be executed by Node
     new NodeTemplatePlugin(outputOptions).apply(childCompiler);
@@ -63,7 +58,7 @@ class PrerenderReactWebpackPlugin {
     new LibraryTemplatePlugin(name, 'commonjs2').apply(childCompiler);
 
     // Add entry plugins to make all of this work
-    entryPlugins(childCompiler.context, this.chunks, parentOptions).apply(childCompiler);
+    entryPlugins(childCompiler.context).apply(childCompiler);
 
     // Needed for HMR. Even if your plugin don't support HMR,
     // this code seems to be always needed just in case to prevent possible errors
@@ -84,6 +79,9 @@ class PrerenderReactWebpackPlugin {
   emitHook(compilation) {
     const stats = compilation.getStats().toJson();
     // Get our output asset
+    this.data.forEach(({chunk, asset, entry}) => {
+      // TODO
+    })
     const asset = compilation.getAsset(this.fileName);
     if (!asset) {
       compilation.errors.push(new Error(`Asset ${this.fileName} not found.`));
@@ -121,47 +119,56 @@ class PrerenderReactWebpackPlugin {
 
  */
   }
-}
 
-function toObj(any) {
-  if (!any) {
-    return {};
-  }
-  if (typeof any === "string") {
-    return [any];
-  }
-  return any
-}
-
-/** Handle "object", "string" and "array" types of entry */
-function entryPlugins(context, chunks, parentOptions) {
-  if (typeof entry === 'string' || Array.isArray(entry)) {
-    itemToPlugin(context, entry, 'main').apply(compiler);
-  } else if (typeof entry === 'object') {
-    Object.keys(entry).forEach(name => {
-      itemToPlugin(context, entry[name], name).apply(compiler);
-    });
-  }
-  return {
-    apply(compiler) {
-      chunks.forEach(chunk => {
-
-      })
+  /**
+   * Initialize this.data with the information needed to keep track of entry points and outgoing
+   * assets. If the array this.options.chunks is present, only prerender those chunks; default to
+   * prerendering all chunks.
+   *
+   * @param entry the entry point given in the parent compiler's options
+   */
+  prepareData(entry) {
+    // {
+    //   chunk: string = chunk name, ex. main, etc.
+    //   asset: string = output filename, ex. chunk.prerender.js
+    //   entry: string | Array<string> = entry point or points, ex. index.js
+    // }
+    if (typeof entry === 'string' || Array.isArray(entry)) {
+      this.data = [{
+        chunk: 'main',
+        asset: 'main.prerender.js',
+        entry: entry
+      }];
+    } else {
+      this.data = Object.keys(entry).map(chunk => ({
+        chunk,
+        asset: `${chunk}.prerender.js`,
+        entry: entry[chunk]
+      }));
+      if (Array.isArray(this.chunks) && this.chunks.length) {
+        this.data = this.data.filter(({chunk}) => this.chunks.indexOf(chunk) !== -1);
+      }
     }
   }
 }
 
-function itemToPlugin(context, item, name) {
-  if (Array.isArray(item)) {
-    return new MultiEntryPlugin(context, item, name);
-  }
-  return new SingleEntryPlugin(context, item, name);
+/** Handle "object", "string" and "array" types of entry */
+function entryPlugins(context) {
+  // For each object in this.data, apply a Single/MultiEntryPlugin to the compiler
+  const plugins = this.data.map(({chunk, asset, entry}) => (
+    new (Array.isArray(entry) ? MultiEntryPlugin : SingleEntryPlugin)(context, entry, chunk)
+  ));
+  return {
+    apply(compiler) {
+      plugins.forEach(plugin => plugin.apply(compiler));
+    }
+  };
 }
 
 // figures out which chunks to prerender, defaults to all
 function getChunks(entry, parentOptions) {
   let parentEntry = parentOptions.entry;
-  let assets = (typeof parentEntry === "string" || Array.isArray(parentEntry)) ? ["main"] : Object.keys(parentEntry);
+  let assets = (typeof parentEntry === 'string' || Array.isArray(parentEntry)) ? ['main'] : Object.keys(parentEntry);
   if (Array.isArray(entry) && entry.length) {
     assets = assets.filter(a => entry.indexOf(a) !== -1);
   }
