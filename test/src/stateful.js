@@ -16,7 +16,7 @@ const App = () => (
   </div>
 );
 
-if (typeof document !== "undefined") {
+if (typeof window !== "undefined") {
   hydrate(<App />, document.getElementById("root"));
 }
 

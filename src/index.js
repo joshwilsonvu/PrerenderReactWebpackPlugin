@@ -1,6 +1,5 @@
-const tapable = require('tapable');
+const { SyncHook } = require('tapable');
 const webpack = require('webpack');
-const {RawSource} = require('webpack-sources');
 const nodeExternals = require('webpack-node-externals');
 //const HtmlWebpackPlugin = require("html-webpack-plugin"); // peer dependency
 const os = require('os');
@@ -11,6 +10,14 @@ const NodeTargetPlugin = require('webpack/lib/node/NodeTargetPlugin');
 const LibraryTemplatePlugin = require('webpack/lib/LibraryTemplatePlugin');
 const SingleEntryPlugin = require('webpack/lib/SingleEntryPlugin');
 const MultiEntryPlugin = require('webpack/lib/MultiEntryPlugin');
+let HtmlWebpackPlugin; // optional dependency
+try {
+  HtmlWebpackPlugin = require('html-webpack-plugin');
+} catch (e) {
+  if (!(e instanceof Error) || e.code !== 'MODULE_NOT_FOUND') {
+    throw e;
+  }
+}
 
 const name = 'PrerenderReactWebpackPlugin';
 
@@ -18,15 +25,21 @@ class PrerenderReactWebpackPlugin {
   constructor(options = {}) {
     this.chunks = options.chunks || []; // the chunks to prerender, e.g. "main"
     this.assets = []; // filenames that would be emitted
+    this.emit = options.emit || false; // whether to emit the prerendering cjs modules
+    let res;
+    this.hooks = {
+      prerendered: new SyncHook(["defaultExport"])
+    };
   }
 
   apply(parentCompiler) {
+    const makeHook = this.makeHook.bind(this), emitHook = this.emitHook.bind(this);
     if (parentCompiler.hooks) {
-      parentCompiler.hooks.make.tapAsync(name, this.makeHook.bind(this));
-      parentCompiler.hooks.emit.tap(name, this.emitHook.bind(this));
+      parentCompiler.hooks.make.tapAsync(name, makeHook);
+      parentCompiler.hooks.emit.tapPromise(name, emitHook);
     } else {
-      parentCompiler.plugin('make', this.makeHook.bind(this));
-      parentCompiler.plugin('emit', this.emitHook.bind(this));
+      parentCompiler.plugin('make', makeHook);
+      parentCompiler.plugin('emit', emitHook);
     }
   }
 
@@ -58,7 +71,7 @@ class PrerenderReactWebpackPlugin {
     new LibraryTemplatePlugin(name, 'commonjs2').apply(childCompiler);
 
     // Add entry plugins to make all of this work
-    entryPlugins(childCompiler.context).apply(childCompiler);
+    this.entryPlugins(childCompiler.context).apply(childCompiler);
 
     // Needed for HMR. Even if your plugin don't support HMR,
     // this code seems to be always needed just in case to prevent possible errors
@@ -79,45 +92,61 @@ class PrerenderReactWebpackPlugin {
   emitHook(compilation) {
     const stats = compilation.getStats().toJson();
     // Get our output asset
-    this.data.forEach(({chunk, asset, entry}) => {
-      // TODO
-    })
-    const asset = compilation.getAsset(this.fileName);
-    if (!asset) {
-      compilation.errors.push(new Error(`Asset ${this.fileName} not found.`));
-      return;
+    return Promise.all(this.data.map(({chunk, asset: assetFile, entry}) => {
+      const asset = compilation.getAsset(assetFile);
+      if (!asset) {
+        compilation.errors.push(new Error(`Asset ${assetFile} not found.`));
+        return;
+      }
+      if (!this.emit) {
+        // require the generated module and extract the prerendered HTML
+        const sourceString = asset.source.source(); // asset.source is Source object (see webpack-sources)
+        let sourceExports;
+        try {
+          sourceExports = requireFromString(sourceString);
+        } catch (error) {
+          compilation.errors.push(error);
+          return;
+        }
+        if (!sourceExports || !sourceExports.default) {
+          compilation.errors.push(new Error(`Missing default export from prerendered chunk ${chunk}`));
+          return;
+        }
+        // should be an HTML snippet or an object of template parameters
+        let defaultExport = sourceExports.default;
+        if (typeof defaultExport === 'function') {
+          defaultExport = defaultExport();
+        }
+        return Promise.resolve(defaultExport).then(defaultExport => { // handle async export
+          console.log(defaultExport);
+
+          // Delete our asset from output, we got the string we wanted
+          delete compilation.assets[assetFile];
+
+          // Call any plugin tapped into the prerendered hook
+          this.hooks.prerendered.call(defaultExport);
+        });
+      }
+    }));
+  }
+
+  hwpHook(compilation) {
+    if (HtmlWebpackPlugin && HtmlWebpackPlugin.getHooks) {
+      // HtmlWebpackPlugin >= 4
+      HtmlWebpackPlugin.getHooks(compilation).beforeAssetTagGeneration.tap(
+        name,
+        function cb(data, callback) {
+          var processTag = self.processTag.bind(self, hwpCompilation);
+          data.assetTags.scripts.filter(util.filterTag).forEach(processTag);
+          data.assetTags.styles.filter(util.filterTag).forEach(processTag);
+          callback(null, data);
+        }
+      );
+    } else if (compilation.hooks.htmlWebpackPluginAlterAssetTags &&
+      compilation.hooks.htmlWebpackPluginBeforeHtmlGeneration) {
+      // HtmlWebpackPlugin 3
+      compilation.hooks.htmlWebpackPluginBeforeHtmlGeneration.tapAsync(name, beforeHtmlGeneration);
     }
-    // asset.source is a Source object (see webpack-sources)
-    const sourceString = asset.source.source();
-    let prerenderedHtml;
-    try {
-      const doPrerender = requireFromString(sourceString).default; // get default export of entry file
-      prerenderedHtml = doPrerender();
-    } catch (error) {
-      compilation.errors.push(error);
-      return;
-    }
-    console.log(prerenderedHtml.slice(0, 1000));
-
-    // Delete our asset from output, we got the string we wanted
-    delete compilation.assets[this.fileName];
-
-    /*
-    // Collect all output assets
-    const assets = Object.keys(compilation.assets);
-
-    // Combine collected assets and child compilation output into new source.
-    // Note: `globalAssets` is global variable
-    let source = new RawSource([
-      `var globalAssets = ${JSON.stringify(assets)}`,
-      `${asset.source}`,
-      ``
-    ].join('\n'));
-
-    // Add out asset back to the output
-    compilation.emitAsset(this.fileName, source);
-
- */
   }
 
   /**
@@ -125,14 +154,13 @@ class PrerenderReactWebpackPlugin {
    * assets. If the array this.options.chunks is present, only prerender those chunks; default to
    * prerendering all chunks.
    *
+   * chunk: string = chunk name, ex. main, etc.
+   * asset: string = output filename, ex. chunk.prerender.js
+   * entry: string | Array<string> = entry point or points, ex. index.js
+   *
    * @param entry the entry point given in the parent compiler's options
    */
   prepareData(entry) {
-    // {
-    //   chunk: string = chunk name, ex. main, etc.
-    //   asset: string = output filename, ex. chunk.prerender.js
-    //   entry: string | Array<string> = entry point or points, ex. index.js
-    // }
     if (typeof entry === 'string' || Array.isArray(entry)) {
       this.data = [{
         chunk: 'main',
@@ -150,30 +178,18 @@ class PrerenderReactWebpackPlugin {
       }
     }
   }
-}
 
-/** Handle "object", "string" and "array" types of entry */
-function entryPlugins(context) {
   // For each object in this.data, apply a Single/MultiEntryPlugin to the compiler
-  const plugins = this.data.map(({chunk, asset, entry}) => (
-    new (Array.isArray(entry) ? MultiEntryPlugin : SingleEntryPlugin)(context, entry, chunk)
-  ));
-  return {
-    apply(compiler) {
-      plugins.forEach(plugin => plugin.apply(compiler));
-    }
-  };
-}
-
-// figures out which chunks to prerender, defaults to all
-function getChunks(entry, parentOptions) {
-  let parentEntry = parentOptions.entry;
-  let assets = (typeof parentEntry === 'string' || Array.isArray(parentEntry)) ? ['main'] : Object.keys(parentEntry);
-  if (Array.isArray(entry) && entry.length) {
-    assets = assets.filter(a => entry.indexOf(a) !== -1);
+  entryPlugins(context) {
+    const plugins = this.data.map(({chunk, entry}) => (
+      new (Array.isArray(entry) ? MultiEntryPlugin : SingleEntryPlugin)(context, entry, chunk)
+    ));
+    return {
+      apply(compiler) {
+        plugins.forEach(plugin => plugin.apply(compiler));
+      }
+    };
   }
-  return assets;
 }
-
 
 module.exports = PrerenderReactWebpackPlugin;
