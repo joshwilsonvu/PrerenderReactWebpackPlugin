@@ -1,4 +1,4 @@
-const { SyncHook } = require('tapable');
+const {SyncHook} = require('tapable');
 const webpack = require('webpack');
 const nodeExternals = require('webpack-node-externals');
 //const HtmlWebpackPlugin = require("html-webpack-plugin"); // peer dependency
@@ -26,20 +26,29 @@ class PrerenderReactWebpackPlugin {
     this.chunks = options.chunks || []; // the chunks to prerender, e.g. "main"
     this.assets = []; // filenames that would be emitted
     this.emit = options.emit || false; // whether to emit the prerendering cjs modules
-    let res;
     this.hooks = {
-      prerendered: new SyncHook(["defaultExport"])
+      prerendered: new SyncHook(['defaultExport'])
     };
   }
 
   apply(parentCompiler) {
-    const makeHook = this.makeHook.bind(this), emitHook = this.emitHook.bind(this);
+    const makeHook = this.makeHook.bind(this);
+    const emitHook = this.emitHook.bind(this);
+    const hwpHook = this.hwpHook.bind(this);
     if (parentCompiler.hooks) {
       parentCompiler.hooks.make.tapAsync(name, makeHook);
-      parentCompiler.hooks.emit.tapPromise(name, emitHook);
+      parentCompiler.hooks.emit.tapAsync(name, emitHook);
     } else {
       parentCompiler.plugin('make', makeHook);
-      parentCompiler.plugin('emit', emitHook);
+      parentCompiler.plugin('emit', emitHook); // TODO won't work with promise
+    }
+
+    if (HtmlWebpackPlugin && HtmlWebpackPlugin.getHooks) {
+      // HtmlWebpackPlugin >= 4
+      HtmlWebpackPlugin.getHooks(compilation).beforeAssetTagGeneration.tap(name, hwpHook);
+    } else if (compilation.hooks.htmlWebpackPluginBeforeHtmlGeneration) {
+      // HtmlWebpackPlugin 3
+      compilation.hooks.htmlWebpackPluginBeforeHtmlGeneration.tapAsync(name, beforeHtmlGeneration);
     }
   }
 
@@ -84,15 +93,15 @@ class PrerenderReactWebpackPlugin {
       }
     });
 
-    childCompiler.runAsChild((err, entries, childCompilation) => {
+    childCompiler.runAsChild(err => {
       done(err);
     });
   }
 
-  emitHook(compilation) {
+  emitHook(compilation, done) {
     const stats = compilation.getStats().toJson();
     // Get our output asset
-    return Promise.all(this.data.map(({chunk, asset: assetFile, entry}) => {
+    Promise.all(this.data.map(({chunk, asset: assetFile, entry}) => {
       const asset = compilation.getAsset(assetFile);
       if (!asset) {
         compilation.errors.push(new Error(`Asset ${assetFile} not found.`));
@@ -118,8 +127,6 @@ class PrerenderReactWebpackPlugin {
           defaultExport = defaultExport();
         }
         return Promise.resolve(defaultExport).then(defaultExport => { // handle async export
-          console.log(defaultExport);
-
           // Delete our asset from output, we got the string we wanted
           delete compilation.assets[assetFile];
 
@@ -127,7 +134,7 @@ class PrerenderReactWebpackPlugin {
           this.hooks.prerendered.call(defaultExport);
         });
       }
-    }));
+    })).then(() => done());
   }
 
   hwpHook(compilation) {
